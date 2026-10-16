@@ -14,15 +14,15 @@
  *    摇杆示教记录目标点 → 按键/指令启动自动绘制 →
  *    运动学逆解把纸面坐标转成关节角 → 插补逐点执行
  *
- *  【重要】本工程为"可编译骨架"：直线/折线/曲线插补框架与状态机完整，
- *  但 `solveIK()` 依赖任务四推导的运动学公式。当前为两连杆几何逆解
- *  （基于 L1/L2 默认长度），联调时须：
- *    1. 实测并填入 L1（后臂）、L2（前臂）长度（毫米）
- *    2. 若关节角与几何角映射不同，修正 IK 输出到舵机角的映射
+ *  【运动学】已对齐 JoyFK_alpha2 定稿模型：
+ *    正解 forwardKin 与逆解 solveIK 互逆，公式见对应函数注释。
+ *    几何参数 L1（底盘高）/L2（后臂）/L3（前臂）按实物标定；
+ *    纸面高度 PEN_Z（笔尖 mz）按实际摆放标定（底座与纸同放桌面时 = 0）。
  *
- *  串口协议（9600 波特率）：
- *    g  直线演示      t 示教模式/记录点    s 折线绘制    c 曲线绘制
- *    p  暂停/继续     x 取消并回中         ? 状态
+ *  按键协议（第二块板 KeypadBoard_Task5 → 本板，9600 波特率）：
+ *    '1' 示教/记录点   '2' 暂停   '3' 继续   '4' 取消
+ *    '5' 折线绘制     '6' 曲线绘制   '7' 直线   '8' 基础图形
+ *   （另保留原串口调试指令 g/t/s/c/p/x/?，未接按键板时可手动调试）
  *
  *  硬件接线：
  *    舵机：base=D9  rArm=D8  fArm=D7  claw=D6（夹爪夹持铅笔）
@@ -47,19 +47,29 @@
 /* ---------------- 舵机限位 ---------------- */
 #define BASE_MIN  0           // 底座角度下限
 #define BASE_MAX  180         // 底座角度上限
-#define RARM_MIN  30          // 后臂角度下限
+#define RARM_MIN  45          // 后臂角度下限（对齐 JoyFK_alpha2）
 #define RARM_MAX  160         // 后臂角度上限（防堵转）
 #define FARM_MIN  30          // 前臂角度下限
-#define FARM_MAX  130         // 前臂角度上限
+#define FARM_MAX  110         // 前臂角度上限（对齐 JoyFK_alpha2）
 #define CLAW_MIN  5           // 夹爪张开极限
-#define CLAW_MAX  100         // 夹爪闭合极限
+#define CLAW_MAX  130         // 夹爪闭合极限（对齐 JoyFK_alpha2）
+#define CLAW_HOLD 120         // 夹笔保持角：绘制/示教时夹爪先闭合夹稳铅笔（堵转响则降到 110~100）
 
-/* ---------------- 机械臂几何参数（须按实物标定！） ----------------
- * L1/L2 是后臂、前臂的长度（毫米），决定逆解结果。
+/* ---------------- 机械臂几何参数（对齐 JoyFK_alpha2 实物标定） ----------------
+ * 运动学模型（JoyFK_alpha2 定稿）：
+ *   L1 = 底盘高度：底座顶面 → 肩轴（mm）
+ *   L2 = 后臂长度：肩 → 肘（mm）
+ *   L3 = 前臂长度：肘 → 腕（mm）
+ *   正解：r = L2·cosα − L3·cos(α+β)；mz = L1 + L2·sinα − L3·sin(α+β)
+ *   角度映射：θ1 = curBase−90（从 Y 轴量起）、α = 180−curRArm、β = curFArm
  * 铅笔固定于夹爪，抬笔/落笔通过前臂角度上抬 PEN_LIFT 度实现。 */
-#define L1  70.0f    // 后臂长度 mm（示例值，须实测！）
-#define L2  80.0f    // 前臂长度 mm（示例值，须实测！）
-#define PEN_LIFT  18 // 抬笔/落笔对应的前臂角度增量（示例值，须标定）
+#define L1  38.0f    // 底盘高度 mm（JoyFK_alpha2 实测）
+#define L2  80.0f    // 后臂长度 mm（JoyFK_alpha2 实测）
+#define L3  80.0f    // 前臂长度 mm（JoyFK_alpha2 实测）
+#define PEN_Z  20.0f // 腕点高度：笔尖触纸时夹爪中心的 mz（mm）= 纸面高度 + 铅笔从夹爪伸出的长度
+                     // 标定：纸与底座同放桌面时纸面 mz=0，腕点高 = 直尺量"夹爪中心→笔尖"距离（示例 20，须实测）
+#define PEN_LIFT  8  // 抬笔量：腕点高度增量（mm），抬笔时腕点升到 PEN_Z+PEN_LIFT、笔尖离纸
+                     // 说明：以腕点抬升 mm 实现（旧版用前臂减角，β 小时被 FARM_MIN 钳制会抬笔失效）
 
 /* ---------------- 摇杆参数 ---------------- */
 #define JOY_CENTER   512      // 摇杆模拟值中点
@@ -133,61 +143,111 @@ void syncMove(int tBase, int tRArm, int tFArm, int tClaw, int stepMs){
 /* ==================== 回中 ====================
  * 功能：所有关节回到 90° 初始姿态 */
 void centerAll(){
-  syncMove(90, 90, 90, 90, servoDelay);
+  syncMove(90, 90, 90, CLAW_HOLD, servoDelay);      // 回待机时夹爪保持闭合夹笔
 }
 
-/* ==================== 运动学逆解（核心，依赖任务四） ====================
- * 输入：末端纸面坐标 (x, y)，肩关节为原点，x 向前、y 向右（右手系，按实物定义）
- * 输出：底座角 bAng、后臂角 rAng、前臂角 fAng（均换算成舵机角度）
- * 实现：平面两连杆几何逆解（任务四推导的代码版）
- *
- * 原理简述：
- *   1. 末端到肩关节的距离 dist = sqrt(x² + y²)，若超出工作空间返回失败
- *   2. 余弦定理求肘关节角 theta2（前臂相对后臂的夹角）
- *   3. 由末端极角减去前臂偏移角得到肩关节角 theta1（后臂角）
- *   4. 几何角(rad) → 舵机角(度) 的映射为占位公式，须按实物修正！
- */
-bool solveIK(float x, float y, int &bAng, int &rAng, int &fAng){
-  float dist = sqrt(x * x + y * y);                 // 末端到肩关节距离
-  if (dist > L1 + L2 - 1.0f || dist < fabs(L1 - L2) + 1.0f){
-    return false;                                   // 目标点不可达（超出工作空间）
+/* ==================== 运动学正解（对齐 JoyFK_alpha2） ====================
+ * 输入：关节几何角 θ1（底座，从 Y 轴量起）、α（后臂仰角）、β（前臂内角），单位度
+ * 输出：腕点坐标 mx、my、mz（mm，原点=底座转轴与地面交点）
+ * 公式（JoyFK_alpha2 定稿，β 内角·前臂下垂模型；θ1 从 Y 轴量起）：
+ *   r  = L2·cosα − L3·cos(α+β)
+ *   mx = r·sinθ1，my = r·cosθ1（θ1=0 时腕点在 Y 方向）
+ *   mz = L1 + L2·sinα − L3·sin(α+β)   ← L3 项为 −：β<90 前臂下垂、mz 减小 */
+void forwardKin(float t1Deg, float aDeg, float bDeg,
+                float &mx, float &my, float &mz){
+  float t1 = radians(t1Deg);
+  float a  = radians(aDeg);
+  float b  = radians(bDeg);
+  float r  = L2 * cos(a) - L3 * cos(a + b);
+  mx = r * sin(t1);                            // X 方向（θ1=0 时为 0）
+  my = r * cos(t1);                            // Y 方向（θ1=0 时 = r，小臂沿 Y 延伸）
+  mz = L1 + L2 * sin(a) - L3 * sin(a + b);     // 高度（− 号：β 内角，前臂下垂）
+}
+
+/* 舵机角 → 几何角（与 JoyFK_alpha2 一致） */
+void servoToGeo(float &t1, float &alpha, float &beta){
+  t1    = (float)(curBase - 90);
+  alpha = (float)(180 - curRArm);
+  beta  = (float)curFArm;
+}
+
+/* 串口打印当前笔尖正解坐标（调试/示教验证用） */
+void printPenPos(){
+  float t1, a, b, mx, my, mz;
+  servoToGeo(t1, a, b);
+  forwardKin(t1, a, b, mx, my, mz);
+  Serial.print("  笔尖(x,y,z): ");
+  Serial.print(mx, 1); Serial.print(", ");
+  Serial.print(my, 1); Serial.print(", ");
+  Serial.println(mz, 1);
+}
+
+/* ==================== 运动学逆解（与 JoyFK_alpha2 正解互逆） ====================
+ * 输入：纸面坐标 (x, y)（x 向前、y 向右，mm）与笔尖高度 z（mz，mm）
+ * 输出：底座角 bAng、后臂角 rAng、前臂角 fAng（舵机角度）
+ * 原理（正解公式求逆）：
+ *   1. 水平投影 R = sqrt(x² + y²)，相对肩轴高度 Z = z − L1
+ *   2. 腕点到肩轴距离 d = sqrt(R² + Z²)，超出工作空间返回失败
+ *   3. 余弦定理求前臂内角 β：d² = L2² + L3² − 2·L2·L3·cosβ
+ *   4. 后臂仰角 α = 腕点极角 φ + 肘部偏移角（atan2(L3·sinβ, L2 − L3·cosβ)）
+ *   5. 底座转角 θ1 = atan2(y, x)（与正解 mx=r·sinθ1, my=r·cosθ1 互逆）
+ *   6. 舵机角映射（与 servoToGeo 互逆）：base = θ1+90、rArm = 180−α、fArm = β */
+bool solveIK(float x, float y, float z, int &bAng, int &rAng, int &fAng){
+  float R = sqrt(x * x + y * y);                 // 腕点水平投影距离
+  float Z = z - L1;                              // 腕点相对肩轴的竖直高度
+  float d = sqrt(R * R + Z * Z);                 // 腕点到肩轴距离
+  if (d > L2 + L3 - 1.0f || d < fabs(L2 - L3) + 1.0f){
+    return false;                                // 目标点不可达（超出工作空间）
   }
-  /* 余弦定理：前臂相对后臂的夹角 cosVal → theta2 */
-  float cosVal = (x * x + y * y - L1 * L1 - L2 * L2) / (2.0f * L1 * L2);
-  if (cosVal > 1.0f) cosVal = 1.0f;                 // 数值保护
-  if (cosVal < -1.0f) cosVal = -1.0f;
-  float theta2 = acos(cosVal);                      // 肘关节角（前臂相对后臂延长方向）
+  /* 余弦定理：前臂内角 β（正解 d² = L2² + L3² − 2·L2·L3·cosβ 的逆） */
+  float cosB = (L2 * L2 + L3 * L3 - d * d) / (2.0f * L2 * L3);
+  if (cosB > 1.0f) cosB = 1.0f;                  // 数值保护
+  if (cosB < -1.0f) cosB = -1.0f;
+  float beta  = acos(cosB);
+  /* 后臂仰角 α = 腕点极角 + 肘部偏移角 */
+  float phi   = atan2(Z, R);                     // 腕点相对肩的极角
+  float alpha = phi + atan2(L3 * sin(beta), L2 - L3 * cos(beta));
+  /* 奇异检测：腕点水平投影若越过肩轴正下方/后方（肘朝后姿态，r≈0 或为负），
+   * 纸面坐标失去唯一方向，返回不可达，避免画出错误动作 */
+  float rChk = L2 * cos(alpha) - L3 * cos(alpha + beta);
+  if (rChk < 5.0f) return false;
+  /* 底座转角 θ1（纸面 y 向右 = mx、x 向前 = my） */
+  float t1 = atan2(y, x);
+  /* 几何角(rad) → 舵机角(度)，与 servoToGeo 互逆 */
+  bAng = (int)round(degrees(t1) + 90.0f);
+  rAng = (int)round(180.0f - degrees(alpha));
+  fAng = (int)round(degrees(beta));
 
-  /* 肩关节角：末端极角 - 前臂引起的角度偏移 */
-  float beta  = atan2(L2 * sin(theta2), L1 + L2 * cos(theta2));
-  float theta1 = atan2(y, x) - beta;                // 后臂相对基准线(竖直)的角度
+  bAng = clampVal(bAng, BASE_MIN, BASE_MAX);    // 底座限位
+  rAng = clampVal(rAng, RARM_MIN, RARM_MAX);    // 后臂限位
+  fAng = clampVal(fAng, FARM_MIN, FARM_MAX);    // 前臂限位
 
-  /* 几何角(rad) → 舵机角(度)（占位映射，按实物方向修正后使用！）：
-   *   后臂舵机：竖直为 90°，向前摆角 → rAng ≈ 90 - degrees(theta1)
-   *   前臂舵机：后臂延长方向为 90° → fAng ≈ 90 - degrees(theta2)
-   *   底座舵机：x-y 平面极角 → bAng ≈ degrees(atan2(y, x)) 映射 0~180 */
-  bAng = (int)round(degrees(atan2(y, x)));
-  rAng = (int)round(90 - degrees(theta1));
-  fAng = (int)round(90 - degrees(theta2));
-
-  bAng = clampVal(bAng, BASE_MIN, BASE_MAX);        // 底座限位
-  rAng = clampVal(rAng, RARM_MIN, RARM_MAX);        // 后臂限位
-  fAng = clampVal(fAng, FARM_MIN, FARM_MAX);        // 前臂限位
+  /* 回代验证：限位钳制可能让目标实际不可达（如双解中底座被钳到极限），
+   * 用正解核对腕点是否真的到达 (x, y)；误差 > 5mm 判定不可达 */
+  float vT1  = radians((float)bAng - 90.0f);
+  float vAlp = radians(180.0f - (float)rAng);
+  float vBet = radians((float)fAng);
+  float vr   = L2 * cos(vAlp) - L3 * cos(vAlp + vBet);
+  float vmx  = vr * sin(vT1);                    // 对应纸面 y（向右）
+  float vmy  = vr * cos(vT1);                    // 对应纸面 x（向前）
+  if (sqrt((vmy - x) * (vmy - x) + (vmx - y) * (vmx - y)) > 5.0f){
+    return false;                                // 钳制后到不了目标
+  }
   return true;
 }
 
 /* ==================== 笔尖移动到纸面坐标 ====================
- * 功能：把笔尖移动到纸面坐标 (x, y)，并按 down 决定抬笔/落笔
+ * 功能：把笔尖移动到纸面坐标 (x, y)（纸面高度 PEN_Z），并按 down 决定抬笔/落笔
  * 说明：抬笔 = 前臂上抬 PEN_LIFT°（笔尖离开纸面），落笔 = 前臂到位 */
 bool movePenTo(float x, float y, bool down){
   int b, r, f;
-  if (!solveIK(x, y, b, r, f)){                     // 逆解失败（不可达）
+  float zT = down ? PEN_Z : PEN_Z + PEN_LIFT;       // 落笔=腕点贴纸面；抬笔=腕点抬升 PEN_LIFT mm
+  if (!solveIK(x, y, zT, b, r, f)){                 // 逆解失败（不可达）
     Serial.print("! 目标不可达 ("); Serial.print(x); Serial.print(",");
     Serial.print(y); Serial.println(")");
     return false;
   }
-  int fTarget = down ? f : f - PEN_LIFT;            // 落笔用前臂角，抬笔上抬
-  syncMove(b, r, fTarget, 90, servoDelay);          // 夹爪保持 90° 夹笔
+  syncMove(b, r, f, CLAW_HOLD, servoDelay);         // 夹爪闭合夹稳铅笔
   penDown = down;                                   // 记录落笔状态
   return true;
 }
@@ -217,7 +277,7 @@ void drawLineTo(Point2D p0, Point2D p1){
  * 功能：画一个三角形（直线插补的调用示例，满足子任务2）
  * 说明：子任务2 可从 N/三角形/Z/V 中任选一种，改三个顶点即可换图形 */
 void demoDrawTriangle(){
-  Point2D a = { -40, 0 }, b = { 40, 0 }, c = { 0, 50 };
+  Point2D a = { 40, 0 }, b = { 70, 0 }, c = { 55, 32 };  // 前臂竖直下垂区三角形（画线中形态稳定、不抬升）
   drawLineTo(a, b);                                 // 边1
   drawLineTo(b, c);                                 // 边2
   drawLineTo(c, a);                                 // 边3
@@ -233,6 +293,7 @@ void drawPolyline(){
     return;
   }
   Serial.println(">>> 折线绘制开始");
+  centerAll();                                      // 先回待机位（考核要求：先回待机再移向第1点）
   for (int i = 0; i + 1 < teachCount; i++){         // 逐段连接
     if (state != S_DRAWING) break;                  // 被取消则中断
     drawLineTo(teachPts[i], teachPts[i + 1]);
@@ -250,6 +311,7 @@ void drawCurve(){
     return;
   }
   Serial.println(">>> 曲线绘制开始");
+  centerAll();                                      // 先回待机位（考核要求：先回待机再移向第1点）
   const int SEGS = 24;                              // 每段细分步数
   for (int i = 0; i + 3 < teachCount + 2; i++){     // 遍历曲线段
     if (state != S_DRAWING) break;                  // 被取消则中断
@@ -285,8 +347,11 @@ void drawCurve(){
  * 功能：进入示教模式，提示用户用摇杆移动笔尖、发 t 记录点 */
 void enterTeach(){
   teachCount = 0;                                   // 清空示教点
+  teachPts[0] = { 50.0f, 0.0f };                    // 预置可达起点（(0,0)在肩轴正上方不可达）
   state = S_TEACH;
-  Serial.println(">>> 示教模式：用摇杆把笔尖移到目标点，发 t 记录（最多5点）；发 s/c 开始绘制");
+  movePenTo(50, 0, false);                          // 笔尖先移到可达示教起点
+  Serial.println(">>> 示教模式：笔尖已到起点(50,0)；摇杆移动笔尖，按键1单击记录（最多5点）；按键3双击=折线 / 三击=曲线");
+  Serial.println("    注意：只能往机械臂前方/两侧推（x 保持正值）；方向反了就调 DIR_JOY1_X/Y");
 }
 
 /* ==================== 示教摇杆操控 ====================
@@ -299,9 +364,14 @@ void joystickTeach(){
   float step = 2.0f;                                // 每次移动 2mm
   if (dX || dY){
     if (teachCount > 0){                            // 有记录点才移动
-      teachPts[teachCount - 1].x += dX * step;      // 更新临时点 x
-      teachPts[teachCount - 1].y += dY * step;      // 更新临时点 y
-      movePenTo(teachPts[teachCount - 1].x, teachPts[teachCount - 1].y, false);
+      float nx = teachPts[teachCount - 1].x + dX * step; // 目标坐标
+      float ny = teachPts[teachCount - 1].y + dY * step;
+      if (movePenTo(nx, ny, false)){                // 可达才移动
+        teachPts[teachCount - 1].x = nx;            // 更新临时点 x
+        teachPts[teachCount - 1].y = ny;            // 更新临时点 y
+      } else {
+        Serial.println("! 该方向越界不可达：反向推，或调 DIR_JOY1_X/Y 方向系数");
+      }
     }
     delay(20);                                      // 移动节拍
   }
@@ -325,24 +395,23 @@ int axisDelta(int pin){
 }
 
 /* ==================== 串口指令解析 ====================
- * 功能：处理一行串口指令（g/t/s/c/p/x/?）
- *  g 直线演示   t 示教/记录   s 折线   c 曲线   p 暂停/继续   x 取消 */
+ * 功能：处理一行指令（按键板指令 '1'~'8'；另保留 g/t/s/c/p/x/? 调试）
+ * 按键映射（与 KeypadBoard_Task5.ino 一致）：
+ *   '1' 示教/记录   '2' 暂停   '3' 继续   '4' 取消
+ *   '5' 折线       '6' 曲线   '7' 直线   '8' 基础图形 */
 void handleCommand(const char *line){
   int len = strlen(line);
   if (len == 0) return;
   char c = tolower(line[0]);                        // 统一小写
   switch (c){
-    case 'g':                                       /* 直线演示 */
-      state = S_DRAWING;
-      Serial.println(">>> 直线绘制演示");
-      movePenTo(-30, 0, false);                     // 抬笔到起点
-      drawLineTo((Point2D){ -30, 0 }, (Point2D){ 30, 20 }); // 画直线
-      state = S_IDLE;                               // 完成后回待机
-      break;
-    case 't':                                       /* 示教模式（t=进入/记录） */
+    case '1':                                       /* 按键1：示教/记录 */
+    case 't':                                       /* 调试：示教/记录 */
       if (state != S_TEACH) enterTeach();           // 未在示教 → 进入
       else {                                        // 已在示教 → 记录当前点
         if (teachCount < 5){
+          if (teachCount > 0){
+            teachPts[teachCount] = teachPts[teachCount - 1]; // 新槽继承当前点（摇杆连续移动不跳变）
+          }
           teachCount++;                             // 确认记录一个点
           Serial.print(">>> 已记录示教点 "); Serial.println(teachCount);
         } else {
@@ -350,27 +419,51 @@ void handleCommand(const char *line){
         }
       }
       break;
-    case 's':                                       /* 折线绘制 */
-      if (state == S_TEACH){ state = S_DRAWING; drawPolyline(); state = S_IDLE; }
-      break;
-    case 'c':                                       /* 曲线绘制 */
-      if (state == S_TEACH){ state = S_DRAWING; drawCurve(); state = S_IDLE; }
-      break;
-    case 'p':                                       /* 暂停/继续（切换） */
+    case '2':                                       /* 按键：暂停 */
       if (state == S_DRAWING){ state = S_PAUSED; Serial.println(">>> 已暂停"); }
-      else if (state == S_PAUSED){ state = S_DRAWING; Serial.println(">>> 已继续"); }
       break;
-    case 'x':                                       /* 取消并回待机 */
+    case '3':                                       /* 按键：继续 */
+      if (state == S_PAUSED){ state = S_DRAWING; Serial.println(">>> 已继续"); }
+      break;
+    case '4':                                       /* 按键：取消 */
+    case 'x':                                       /* 调试：取消 */
       state = S_IDLE;
       Serial.println(">>> 已取消，回待机");
       centerAll();                                  // 回中待机位
       break;
+    case '5':                                       /* 按键：折线绘制 */
+    case 's':                                       /* 调试：折线 */
+      if (state == S_TEACH){ state = S_DRAWING; drawPolyline(); state = S_IDLE; }
+      break;
+    case '6':                                       /* 按键：曲线绘制 */
+    case 'c':                                       /* 调试：曲线 */
+      if (state == S_TEACH){ state = S_DRAWING; drawCurve(); state = S_IDLE; }
+      break;
+    case '7':                                       /* 按键：直线演示 */
+    case 'g':                                       /* 调试：直线 */
+      state = S_DRAWING;
+      Serial.println(">>> 直线绘制演示");
+      movePenTo(40, 0, false);                      // 抬笔到起点（前臂竖直下垂区，避免画线中翻转抬升）
+      drawLineTo((Point2D){ 40, 0 }, (Point2D){ 70, 0 }); // 画直线
+      state = S_IDLE;                               // 完成后回待机
+      break;
+    case '8':                                       /* 按键：基础图形 */
+      state = S_DRAWING;
+      Serial.println(">>> 基础图形绘制（三角形）");
+      demoDrawTriangle();                           // 画三角形
+      state = S_IDLE;
+      break;
+    case 'p':                                       /* 调试：暂停/继续（切换） */
+      if (state == S_DRAWING){ state = S_PAUSED; Serial.println(">>> 已暂停"); }
+      else if (state == S_PAUSED){ state = S_DRAWING; Serial.println(">>> 已继续"); }
+      break;
     case '?':                                       /* 状态查询 */
       Serial.print("状态:"); Serial.print(state);
-      Serial.print(" 示教点数:"); Serial.println(teachCount);
+      Serial.print(" 示教点数:"); Serial.print(teachCount);
+      printPenPos();                                // 正解显示当前笔尖坐标
       break;
     default:                                        /* 未知指令 */
-      Serial.println("! 指令：g直线 | t示教/记录 | s折线 | c曲线 | p暂停/继续 | x取消");
+      Serial.println("! 指令：1示教/记录 2暂停 3继续 4取消 5折线 6曲线 7直线 8图形 | 调试 g/t/s/c/p/x/?");
       break;
   }
 }
@@ -400,13 +493,13 @@ void setup(){
   fArm.attach(PIN_FARM);  delay(200);
   claw.attach(PIN_CLAW);  delay(200);
 
-  base.write(90); rArm.write(90); fArm.write(90); claw.write(90);
+  base.write(90); rArm.write(90); fArm.write(90); claw.write(CLAW_HOLD);  // 上电先闭合夹爪夹笔
   delay(300);
 
   Serial.begin(9600);
-  Serial.println("=== Task5 轨迹绘制（骨架）===");
-  Serial.println("注意：solveIK 为默认几何模型，须按实物标定 L1/L2 与角度映射！");
-  Serial.println("指令：g直线 | t示教/记录 | s折线 | c曲线 | p暂停/继续 | x取消 | ?状态");
+  Serial.println("=== Task5 轨迹绘制 ===");
+  Serial.println("运动学：对齐 JoyFK_alpha2；PEN_Z=腕点高度(笔尖触纸时)按实物标定；绘制中夹爪闭合夹笔");
+  Serial.println("按键：1示教/记录 2暂停 3继续 4取消 5折线 6曲线 7直线 8图形（调试 g/t/s/c/p/x/?）");
 }
 
 /* ==================== 主循环 ====================

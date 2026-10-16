@@ -55,12 +55,14 @@
 /* ---------------- 舵机限位（超限自动钳制，保护舵机） ---------------- */
 #define BASE_MIN  0           // 底座角度下限
 #define BASE_MAX  180         // 底座角度上限
-#define RARM_MIN  30          // 后臂角度下限
+#define RARM_MIN  45          // 后臂角度下限（对齐 JoyFK_alpha2）
 #define RARM_MAX  160         // 后臂角度上限（防堵转）
 #define FARM_MIN  30          // 前臂角度下限
-#define FARM_MAX  130         // 前臂角度上限
-#define CLAW_MIN  5           // 夹爪张开极限角度（O 指令的目标）
-#define CLAW_MAX  100         // 夹爪闭合极限角度（S 指令的目标）
+#define FARM_MAX  110         // 前臂角度上限（对齐 JoyFK_alpha2）
+#define CLAW_MIN  5           // 夹爪张开极限
+#define CLAW_MAX  130         // 夹爪闭合极限（对齐 JoyFK_alpha2）
+
+
 
 /* ---------------- 摇杆控制参数 ----------------
  * 摇杆是"速度控制"而非"位置跟随"：推杆越远离中位，关节转动越快。 */
